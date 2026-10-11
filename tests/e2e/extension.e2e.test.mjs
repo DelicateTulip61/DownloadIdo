@@ -1,0 +1,504 @@
+// End-to-end: loads the unpacked extension into Playwright's Chromium, right-clicks real
+// elements on fixture pages, triggers the same handler the context menu uses, and checks
+// what lands on disk. Native context menus can't be clicked by automation, so the menu
+// click itself is simulated via the service worker's exported handleMenuClick.
+import { test, before, after } from 'node:test';
+import assert from 'node:assert/strict';
+import { spawn, spawnSync, execFileSync } from 'node:child_process';
+import fs from 'node:fs';
+import http from 'node:http';
+import os from 'node:os';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { chromium } from 'playwright';
+import { makeFixtures } from './make-fixtures.mjs';
+
+const here = path.dirname(fileURLToPath(import.meta.url));
+const root = path.resolve(here, '..', '..');
+const extDir = path.join(root, 'extension');
+const siteDir = path.join(here, 'site');
+const CDP_PORT = 9334;
+const DOWNLOAD_TIMEOUT_MS = 30000;
+
+let mediaDir;
+let server;
+let port;
+let proc;
+let browser;
+let page;
+let sw;
+let tmp;
+let dlDir;
+let keepAlive;
+const stats = { hot403: 0, hls403: 0 };
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const contentType = (f) => ({
+  '.html': 'text/html', '.js': 'text/javascript', '.png': 'image/png', '.jpg': 'image/jpeg',
+  '.mp4': 'video/mp4', '.m4s': 'video/iso.segment', '.m3u8': 'application/vnd.apple.mpegurl', '.ts': 'video/mp2t',
+}[path.extname(f)] || 'application/octet-stream');
+
+function serveFile(res, file, transform, { cors = true } = {}) {
+  if (!fs.existsSync(file)) { res.writeHead(404).end(); return; }
+  const body = transform ? transform(fs.readFileSync(file, 'utf8')) : fs.readFileSync(file);
+  res.writeHead(200, { 'content-type': contentType(file), ...(cors ? { 'access-control-allow-origin': '*' } : {}) }).end(body);
+}
+
+const fromTestPage = (req) => String(req.headers.referer || '').startsWith(`http://localhost:${port}/`);
+// Stream segments only load for pages on their own host (an embedded player's frame, not its parent).
+const fromSameHost = (req) => String(req.headers.referer || '').startsWith(`http://${req.headers.host}/`);
+
+// A decoy "ad" stream: 60 s long, so it must not be mistaken for a shorter video on the page.
+const AD_PLAYLIST = ['#EXTM3U', '#EXT-X-TARGETDURATION:20', ...[0, 1, 2].flatMap((i) => ['#EXTINF:20,', `hls/seg${i}.ts`]), '#EXT-X-ENDLIST'].join('\n');
+
+function startServer() {
+  server = http.createServer((req, res) => {
+    const url = new URL(req.url, 'http://x');
+    const p = decodeURIComponent(url.pathname);
+    if (p === '/hls.js') return serveFile(res, path.join(root, 'node_modules/hls.js/dist/hls.min.js'));
+    if (p === '/noext/photo') return serveFile(res, path.join(mediaDir, 'noext.png'));
+    // WordPress-style resized copies; only "wpfull" has a full-size original on the server.
+    const wp = { 'wpfull-300x200.jpg': 'small.jpg', 'wpfull.jpg': 'big.jpg', 'wpgone-300x200.jpg': 'small.jpg' };
+    if (p.startsWith('/wp-content/uploads/')) return serveFile(res, path.join(mediaDir, wp[p.slice(20)] || 'missing'));
+    if (p === '/protected/hot.jpg') {
+      // Cross-origin hotlink protection, no CORS: only requests carrying the page's Referer pass.
+      if (!fromTestPage(req)) { stats.hot403++; res.writeHead(403).end('no hotlinking'); return; }
+      return serveFile(res, path.join(mediaDir, 'hot.jpg'), undefined, { cors: false });
+    }
+    if (p === '/media/ad.m3u8') return res.writeHead(200, { 'content-type': 'application/vnd.apple.mpegurl' }).end(AD_PLAYLIST);
+    if (p.startsWith('/media/hls/') && !fromSameHost(req)) { stats.hls403++; res.writeHead(403).end(); return; }
+    if (p.startsWith('/media/')) return serveFile(res, path.join(mediaDir, p.slice(7)));
+    if (p.startsWith('/dl/')) return serveFile(res, path.join(dlDir, p.slice(4))); // downloaded files, for playback checks
+    const file = path.join(siteDir, p === '/' ? 'index.html' : p);
+    return serveFile(res, file, file.endsWith('.html') ? (t) => t.replaceAll('__PORT__', String(port)) : undefined);
+  });
+  return new Promise((r) => server.listen(0, () => { port = server.address().port; r(); }));
+}
+
+const SW_EVAL_TIMEOUT_MS = 5000; // a stale worker handle hangs instead of rejecting
+const SW_ACTION_TIMEOUT_MS = 60000;
+let ctx;
+let extOrigin;
+
+async function installSpy(worker) {
+  await worker.evaluate(() => {
+    self.__notes = self.__notes || [];
+    chrome.notifications.create = (opts) => { self.__notes.push(opts); };
+  });
+}
+
+/**
+ * The extension's service worker as a live Playwright handle. MV3 workers get stopped and
+ * restarted by Chrome; a navigation fires our webRequest listener, which wakes it again.
+ */
+async function liveWorker() {
+  if (sw && !sw.__closed) return sw;
+  for (let i = 0; i < 50; i++) {
+    const found = ctx.serviceWorkers().find((w) => w.url().startsWith(extOrigin));
+    if (found) {
+      found.on('close', () => { found.__closed = true; });
+      await installSpy(found);
+      sw = found;
+      return sw;
+    }
+    if (i % 10 === 0) {
+      const waker = await ctx.newPage();
+      await waker.goto(`http://localhost:${port}/iframe.html`).catch(() => {});
+      await waker.close();
+    }
+    await sleep(200);
+  }
+  throw new Error('extension service worker not available');
+}
+
+function withTimeout(promise, ms) {
+  return Promise.race([promise, sleep(ms).then(() => { throw new Error('service worker evaluate timed out'); })]);
+}
+
+/** Read-only evaluation in the worker: retried on a stale/restarted handle. */
+async function swEval(fn, arg) {
+  for (let attempt = 0; ; attempt++) {
+    const worker = await liveWorker();
+    try {
+      // A restarted worker is a fresh instance: put the notification spy back first.
+      await withTimeout(worker.evaluate(() => !!self.__notes).then((has) => has || installSpy(worker)), SW_EVAL_TIMEOUT_MS);
+      return await withTimeout(worker.evaluate(fn, arg), SW_EVAL_TIMEOUT_MS);
+    } catch (e) {
+      if (attempt >= 2 || !/closed|restarted|timed out|Target/i.test(String(e))) throw e;
+      if (!/restarted/i.test(String(e))) worker.__closed = true;
+    }
+  }
+}
+
+/** A side-effecting call (menu click): make sure the handle is live, then run it exactly once. */
+async function swAction(fn, arg) {
+  for (let attempt = 0; ; attempt++) {
+    await swEval(() => true);
+    try {
+      return await withTimeout(sw.evaluate(fn, arg), SW_ACTION_TIMEOUT_MS);
+    } catch (e) {
+      // The worker restarted under us before the call ran; Chrome does this to idle MV3 workers.
+      if (attempt >= 1 || !/restarted/i.test(String(e))) throw e;
+    }
+  }
+}
+
+async function findExtensionOrigin() {
+  for (let i = 0; i < 50; i++) {
+    for (const w of ctx.serviceWorkers()) {
+      if (await w.evaluate(() => !!self.DownloadIdo).catch(() => false)) return w.url().replace(/[^/]*$/, ''); // "chrome-extension://<id>/" (URL.origin is 'null' here)
+    }
+    await sleep(200);
+  }
+  throw new Error('extension service worker not found');
+}
+
+before(async () => {
+  mediaDir = makeFixtures();
+  await startServer();
+  tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'downloadido-'));
+  dlDir = path.join(tmp, 'dl');
+  fs.mkdirSync(path.join(tmp, 'ud', 'Default'), { recursive: true });
+  fs.mkdirSync(dlDir);
+  fs.writeFileSync(path.join(tmp, 'ud', 'Default', 'Preferences'),
+    JSON.stringify({ download: { default_directory: dlDir, prompt_for_download: false } }));
+
+  proc = spawn(chromium.executablePath(), [
+    '--headless=new', `--user-data-dir=${path.join(tmp, 'ud')}`, `--remote-debugging-port=${CDP_PORT}`,
+    `--disable-extensions-except=${extDir}`, `--load-extension=${extDir}`, '--no-first-run', '--autoplay-policy=no-user-gesture-required',
+    'about:blank',
+  ]);
+  for (let i = 0; i < 50 && !browser; i++) {
+    browser = await chromium.connectOverCDP(`http://127.0.0.1:${CDP_PORT}`).catch(() => null);
+    if (!browser) await sleep(200);
+  }
+  ctx = browser.contexts()[0];
+  // connectOverCDP renames downloads to GUIDs; restore Chrome's normal behaviour.
+  const cdp = await browser.newBrowserCDPSession();
+  await cdp.send('Browser.setDownloadBehavior', { behavior: 'default' });
+  extOrigin = await findExtensionOrigin();
+  // Playwright's evaluate() isn't an extension event, so Chrome would stop the idle
+  // worker after 30 s. Real menu clicks are events; calling an extension API keeps it alive here.
+  page = await ctx.newPage();
+  await liveWorker();
+  // The first chrome.downloads call in a brand-new profile can stall for a long time while
+  // Chrome sets up its download system; do it once here so tests measure the extension.
+  // That first call may never resolve at all, so don't wait for it forever.
+  await withTimeout(sw.evaluate(() => chrome.downloads.download({ url: chrome.runtime.getURL('icons/icon16.png'), filename: 'warmup.png' })), 30000)
+    .catch(() => {});
+  keepAlive = setInterval(() => sw && !sw.__closed && sw.evaluate(() => chrome.runtime.getPlatformInfo()).catch(() => {}), 5000);
+});
+
+after(async () => {
+  clearInterval(keepAlive);
+  await browser?.close().catch(() => {});
+  proc?.kill();
+  server?.close();
+});
+
+// ------------------------------------------------------------------ helpers
+
+async function tabIdFor(url) {
+  return swEval((u) => chrome.tabs.query({}).then((tabs) => tabs.find((t) => t.url === u).id), url);
+}
+
+async function maxDownloadId() {
+  return swEval(() => chrome.downloads.search({}).then((a) => a.reduce((m, d) => Math.max(m, d.id), 0)));
+}
+
+async function waitForDownloads(afterId, count) {
+  const deadline = Date.now() + DOWNLOAD_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    const items = await swEval((id) => chrome.downloads.search({})
+      .then((a) => a.filter((d) => d.id > id).map((d) => ({ id: d.id, state: d.state, filename: d.filename, error: d.error }))), afterId);
+    const done = items.filter((d) => d.state === 'complete');
+    if (done.length >= count && !items.some((d) => d.state === 'in_progress')) {
+      return done.map((d) => path.relative(dlDir, d.filename).replaceAll('\\', '/'));
+    }
+    await sleep(250);
+  }
+  const items = await swEval((id) => chrome.downloads.search({}).then((a) => a.filter((d) => d.id > id)), afterId);
+  const seen = items.map((d) => `${d.state}:${d.error || ''}:${path.basename(d.filename)}`).join(', ');
+  throw new Error(`timed out waiting for ${count} download(s); got [${seen}]; notes ${JSON.stringify(await notes())}`);
+}
+
+async function notes() {
+  return swEval(() => self.__notes.splice(0));
+}
+
+async function rightClick(selector, frameUrlPart) {
+  await page.locator(selector).scrollIntoViewIfNeeded();
+  await page.waitForTimeout(150); // let hit-testing (incl. cross-process iframes) catch up with the scroll
+  const box = await page.locator(selector).boundingBox();
+  await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2, { button: 'right' });
+  let frameId = 0;
+  if (frameUrlPart) {
+    const tabId = await tabIdFor(page.url());
+    frameId = await swEval(async ({ tabId, part }) => {
+      const res = await chrome.scripting.executeScript({ target: { tabId, allFrames: true }, func: () => location.href });
+      return res.find((r) => r.result.includes(part)).frameId;
+    }, { tabId, part: frameUrlPart });
+  }
+  return frameId;
+}
+
+async function clickMenu(menuItemId, frameId = 0) {
+  const tabId = await tabIdFor(page.url());
+  // Pass the real Tab object, as contextMenus.onClicked does.
+  await swAction(async ({ menuItemId, frameId, tabId }) =>
+    self.DownloadIdo.handleMenuClick({ menuItemId, frameId }, await chrome.tabs.get(tabId)), { menuItemId, frameId, tabId });
+}
+
+async function downloadOne(selector, { frame, count = 1 } = {}) {
+  const start = await maxDownloadId();
+  const frameId = await rightClick(selector, frame);
+  await clickMenu('downloadido-one', frameId);
+  return waitForDownloads(start, count).catch((e) => { throw new Error(`${selector}: ${e.message}`); });
+}
+
+const sameBytes = (a, b) => fs.readFileSync(a).equals(fs.readFileSync(b));
+const inDl = (rel) => path.join(dlDir, rel);
+
+async function waitForFrame(part) {
+  for (let i = 0; i < 100; i++) {
+    const f = page.frames().find((fr) => fr.url().includes(part));
+    if (f) return f;
+    await sleep(100);
+  }
+  throw new Error(`frame ${part} not found`);
+}
+
+// ------------------------------------------------------------------ menus
+
+test('both context menu items are registered', async () => {
+  const ok = await swEval(() => Promise.all([
+    chrome.contextMenus.update('downloadido-one', {}),
+    chrome.contextMenus.update('downloadido-all', {}),
+  ]).then(() => true, (e) => String(e)));
+  assert.equal(ok, true);
+});
+
+// ------------------------------------------------------------------ images
+
+test('images: plain, best-resolution, overlays, backgrounds, shadow DOM, iframe, lazy, links', async () => {
+  await page.goto(`http://localhost:${port}/`);
+  await page.waitForLoadState('load');
+  const cases = [
+    ['#plain', 'plain.png'],
+    ['#srcset', 'big.jpg'],
+    ['#picture', 'pic-big.jpg'],
+    ['#overlay', 'overlay.jpg'],
+    ['#pe-none', 'pe-none.jpg'],
+    ['#bg', 'bg.jpg'],
+    ['#pseudo', 'pseudo.jpg'],
+    ['#shadow', 'shadow.jpg'],
+    ['#lazy', 'lazy.jpg'],
+    ['#linked', 'linked-full.jpg'],
+    ['#noext', 'photo.png'],
+    ['#wp', 'wpfull.jpg'], // resized copy swapped for the full-size original
+    ['#wpgone', 'wpgone-300x200.jpg'], // original 404s: keep the copy that exists
+  ];
+  for (const [selector, expected] of cases) {
+    const [file] = await downloadOne(selector);
+    assert.equal(file, `DownloadIdo/${expected}`, selector);
+  }
+  const [framed] = await downloadOne('#frame', { frame: 'iframe.html' });
+  assert.equal(framed, 'DownloadIdo/iframe.jpg');
+  assert.ok(sameBytes(inDl('DownloadIdo/plain.png'), path.join(mediaDir, 'plain.png')));
+  assert.ok(sameBytes(inDl('DownloadIdo/wpfull.jpg'), path.join(mediaDir, 'big.jpg')), 'full-size original, not the thumbnail');
+});
+
+test('install/update re-injects a live detector over a dead (invalidated) one', async () => {
+  const tabId = await tabIdFor(page.url());
+  const probe = (id) => chrome.scripting.executeScript({
+    target: { tabId: id, frameIds: [0] },
+    func: () => {
+      const c = globalThis.DownloadIdoContent;
+      return {
+        alive: typeof c.isAlive === 'function' && c.isAlive(),
+        stale: !!c.stale,
+        staleHelpers: !!(globalThis.DownloadIdoUtils.stale || globalThis.DownloadIdoFmp4.stale),
+      };
+    },
+  }).then((r) => r[0].result);
+  // Simulate everything an older build left in this isolated world: a detector without
+  // isAlive, and its helper libraries.
+  await swEval((id) => chrome.scripting.executeScript({
+    target: { tabId: id, frameIds: [0] },
+    func: () => {
+      globalThis.DownloadIdoContent = { stale: true, resolveTarget: () => ({ kind: 'none' }) };
+      globalThis.DownloadIdoUtils = { ...globalThis.DownloadIdoUtils, stale: true };
+      globalThis.DownloadIdoFmp4 = { ...globalThis.DownloadIdoFmp4, stale: true };
+    },
+  }), tabId);
+  assert.deepEqual(await swEval(probe, tabId), { alive: false, stale: true, staleHelpers: true });
+  await swAction(() => self.DownloadIdo.injectIntoOpenTabs());
+  assert.deepEqual(await swEval(probe, tabId), { alive: true, stale: false, staleHelpers: false });
+  // Injecting the files again (as bulk download does) must not throw in an already-set-up world.
+  const errors = await swEval((id) => chrome.scripting.executeScript({
+    target: { tabId: id, frameIds: [0] }, files: ['lib/utils.js', 'lib/fmp4.js', 'content/detect.js'],
+  }).then((r) => r.map((x) => (x.error ? String(x.error.message || x.error) : ''))), tabId);
+  assert.deepEqual(errors.filter(Boolean), []);
+  const [file] = await downloadOne('#plain');
+  assert.match(file, /^DownloadIdo\/plain( \(\d+\))?\.png$/);
+});
+
+test('a page cannot redirect the download with a synthetic right-click', async () => {
+  await rightClick('#plain');
+  await page.evaluate(() => {
+    const r = document.getElementById('bg').getBoundingClientRect();
+    document.dispatchEvent(new MouseEvent('contextmenu', { clientX: r.x + 10, clientY: r.y + 10, bubbles: true }));
+  });
+  const start = await maxDownloadId();
+  await clickMenu('downloadido-one');
+  const [file] = await waitForDownloads(start, 1);
+  assert.match(file, /^DownloadIdo\/plain( \(\d+\))?\.png$/);
+});
+
+test('blob: image is copied out of the page', async () => {
+  const [file] = await downloadOne('#blobimg');
+  assert.equal(file, 'DownloadIdo/image.png');
+  assert.ok(sameBytes(inDl(file), path.join(mediaDir, 'plain.png')));
+});
+
+test('cross-origin hotlink-protected image is retried with the page Referer', async () => {
+  const [file] = await downloadOne('#hot');
+  assert.equal(file, 'DownloadIdo/hot.jpg');
+  assert.ok(sameBytes(inDl(file), path.join(mediaDir, 'hot.jpg')));
+  console.log(`  (server rejected ${stats.hot403} referer-less request(s) before the fallback)`);
+});
+
+test('direct mp4 video downloads the original file, not the play-button sprite over it', async () => {
+  const [file] = await downloadOne('#mp4');
+  assert.equal(file, 'DownloadIdo/clip.mp4');
+  assert.ok(sameBytes(inDl(file), path.join(mediaDir, 'clip.mp4')));
+});
+
+test('empty spot downloads nothing and explains why', async () => {
+  const start = await maxDownloadId();
+  await notes();
+  await rightClick('#empty');
+  await clickMenu('downloadido-one');
+  await sleep(1000);
+  assert.equal(await maxDownloadId(), start);
+  const [n] = await notes();
+  assert.deepEqual([n.title, n.message], ['Nothing to download', 'No image or video found under the cursor.']);
+});
+
+test('download all: every frame, skips tiny images, own subfolder', async () => {
+  const start = await maxDownloadId();
+  await clickMenu('downloadido-all');
+  const files = await waitForDownloads(start, 16);
+  const names = files.map((f) => path.basename(f)).sort();
+  for (const f of files) assert.match(f, /^DownloadIdo\/localhost \d{4}-\d\d-\d\d \d\d-\d\d\//);
+  for (const expected of ['big.jpg', 'pic-big.jpg', 'bg.jpg', 'pseudo.jpg', 'shadow.jpg', 'iframe.jpg', 'clip.mp4', 'lazy.jpg',
+    'linked-full.jpg', 'photo.png', 'hot.jpg', 'wpfull.jpg', 'wpgone-300x200.jpg']) {
+    assert.ok(names.includes(expected), `missing ${expected} in ${names.join(', ')}`);
+  }
+  assert.ok(!names.includes('tiny.png'), 'tiny image should be skipped');
+});
+
+// ------------------------------------------------------------------ streams
+
+async function openStream(mode) {
+  await page.goto(`http://localhost:${port}/streams.html?mode=${mode}`);
+  await page.waitForFunction(() => window.ready !== false, null, { timeout: 20000 });
+  assert.equal(await page.evaluate(() => window.ready), true);
+}
+
+function ffprobe(file) {
+  return JSON.parse(execFileSync('ffprobe', ['-v', 'error', '-show_entries', 'format=duration:stream=codec_type', '-of', 'json', file]));
+}
+
+test('HLS stream (hls.js, AES-128) is saved in full from the sniffed playlist', async () => {
+  await openStream('hls');
+  const [file] = await downloadOne('#v');
+  assert.match(file, /^DownloadIdo\/Stream Test( \(\d+\))?\.ts$/);
+  const info = ffprobe(inDl(file));
+  assert.ok(Math.abs(parseFloat(info.format.duration) - 6) < 0.5, `duration ${info.format.duration}`);
+  assert.deepEqual(info.streams.map((s) => s.codec_type).sort(), ['audio', 'video']);
+  assert.equal(stats.hls403, 0, 'offscreen requests should carry the page Referer');
+});
+
+test('HLS player inside a cross-origin iframe is fetched with the iframe as Referer', async () => {
+  await page.goto(`http://localhost:${port}/player.html`);
+  const frame = await waitForFrame('streams.html');
+  await frame.waitForFunction(() => window.ready !== false, null, { timeout: 20000 });
+  assert.equal(await frame.evaluate(() => window.ready), true);
+  const before403 = stats.hls403;
+  const [file] = await downloadOne('#player', { frame: 'streams.html' });
+  assert.match(file, /^DownloadIdo\/Stream Test( \(\d+\))?\.ts$/);
+  assert.ok(Math.abs(parseFloat(ffprobe(inDl(file)).format.duration) - 6) < 0.5);
+  assert.equal(stats.hls403, before403, 'segments must be requested with the iframe URL as Referer');
+});
+
+/** Checks a downloaded file decodes cleanly in ffmpeg AND plays (picture + sound) in Chromium. */
+async function assertPlayable(rel, seconds) {
+  const file = inDl(rel);
+  assert.deepEqual(ffprobe(file).streams.map((s) => s.codec_type).sort(), ['audio', 'video']);
+  assert.equal(spawnSync('ffmpeg', ['-v', 'error', '-i', file, '-f', 'null', '-'], { encoding: 'utf8' }).stderr.trim(), '');
+  await page.goto(`http://localhost:${port}/iframe.html`);
+  const r = await page.evaluate(async (src) => {
+    const v = document.createElement('video');
+    v.muted = true;
+    v.src = src;
+    document.body.append(v);
+    await new Promise((ok, fail) => { v.onloadedmetadata = ok; v.onerror = () => fail(new Error(String(v.error && v.error.message))); });
+    await v.play();
+    await new Promise((ok) => setTimeout(ok, 1000));
+    return { duration: v.duration, width: v.videoWidth, audioBytes: v.webkitAudioDecodedByteCount };
+  }, `/dl/${rel.split('/').map(encodeURIComponent).join('/')}`);
+  assert.ok(Math.abs(r.duration - seconds) < 0.5, `duration ${r.duration}`);
+  assert.ok(r.width > 0, 'video decoded');
+  assert.ok(r.audioBytes > 0, 'audio decoded');
+}
+
+test('fMP4 HLS with separate audio is joined into one playable MP4', async () => {
+  await openStream('hls2');
+  const [file] = await downloadOne('#v');
+  assert.match(file, /^DownloadIdo\/Stream Test( \(\d+\))?\.mp4$/);
+  await assertPlayable(file, 6);
+});
+
+test('MSE player with separate audio/video buffers is joined into one playable MP4', async () => {
+  await openStream('mse2');
+  const [file] = await downloadOne('#v');
+  assert.match(file, /^DownloadIdo\/Stream Test( \(\d+\))?\.mp4$/);
+  await assertPlayable(file, 4);
+});
+
+test('a decoy playlist with the wrong length is ignored; MSE capture is used instead', async () => {
+  await openStream('mse&ad=1');
+  const [file] = await downloadOne('#v');
+  assert.match(file, /^DownloadIdo\/Stream Test( \(\d+\))?\.mp4$/);
+  assert.ok(sameBytes(inDl(file), path.join(mediaDir, 'frag.mp4')));
+});
+
+test('MSE player without a playlist: captured buffers equal the source', async () => {
+  await openStream('mse');
+  await notes();
+  const [file] = await downloadOne('#v');
+  assert.match(file, /^DownloadIdo\/Stream Test( \(\d+\))?\.mp4$/);
+  assert.ok(sameBytes(inDl(file), path.join(mediaDir, 'frag.mp4')));
+  const [n] = await notes();
+  assert.equal(n.title, 'Video saved (partial capture)');
+});
+
+test('blob-backed video saves the whole blob', async () => {
+  await openStream('blob');
+  const [file] = await downloadOne('#v');
+  assert.match(file, /^DownloadIdo\/Stream Test( \(\d+\))?\.mp4$/);
+  assert.ok(sameBytes(inDl(file), path.join(mediaDir, 'clip.mp4')));
+});
+
+test('DRM video is refused with a notice', async () => {
+  await openStream('drm');
+  const start = await maxDownloadId();
+  await notes();
+  await rightClick('#v');
+  await clickMenu('downloadido-one');
+  await sleep(1000);
+  assert.equal(await maxDownloadId(), start);
+  const [n] = await notes();
+  assert.equal(n.title, 'Protected video');
+});
