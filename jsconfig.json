@@ -6,9 +6,21 @@
     "strict": false,
     "target": "ES2022",
     "module": "preserve",
-    "lib": ["ES2022", "DOM", "DOM.Iterable"],
-    "types": ["chrome"],
+    "lib": [
+      "ES2022",
+      "DOM",
+      "DOM.Iterable"
+    ],
+    "types": [
+      "chrome"
+    ],
     "skipLibCheck": true
   },
-  "include": ["extension/**/*.js", "types/**/*.d.ts"]
+  "include": [
+    "extension/**/*.js",
+    "types/**/*.d.ts"
+  ],
+  "exclude": [
+    "extension/vendor/**"
+  ]
 }

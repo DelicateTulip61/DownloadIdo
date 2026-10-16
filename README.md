@@ -24,7 +24,12 @@ Needs Chrome 121 or later.
 | Other streaming players (blob/MediaSource) | Saves what the player has loaded, joining separate audio and video into one `.mp4` when both are MP4. Let the video play to the end first for the full file. Capture memory is capped at 512 MB per tab (oldest captures dropped first), and DRM players are never captured |
 | DRM video (Netflix, Disney+, Spotify…) | Refused. It can't be downloaded |
 
-A second menu item, **Download all images and videos on this page**, saves everything (images
+**Download audio as MP3** saves the sound of the video or `<audio>` you right-clicked as an
+`.mp3` (192 kbps). It works on plain files, HLS streams (only the audio is fetched when the
+stream has a separate audio track) and streaming players. MP3 sources are saved as-is, without
+re-encoding. Audio is converted in your browser; nothing is uploaded anywhere.
+
+A third menu item, **Download all images and videos on this page**, saves everything (images
 smaller than 64 px are skipped) into `Downloads/DownloadIdo/<site> <date time>/`.
 Streamed videos are skipped there; right-click each one instead.
 
@@ -38,6 +43,8 @@ The toolbar badge shows progress while a stream downloads.
 - Chrome menus can't be shown per element, so the menu items appear on every right-click.
 - A public web page can't make the extension request addresses on your local network (router, `localhost`, and so on). Pages that are themselves on your network still work.
 - HLS segments that use `#EXT-X-MAP` more than once (ad splices) aren't joined correctly.
+- MP3: up to 60 minutes of audio and 1 GB of input, because the decoded audio is held in
+  memory. Streaming players give only what has loaded, as with video.
 
 ## Development
 ```bash
@@ -60,10 +67,13 @@ npm test
   - `offscreen/`: HLS download and join, Referer re-fetch
   - `lib/utils.js`: pure helpers
   - `lib/fmp4.js`: joins fragmented-MP4 audio and video
+  - `lib/mp3.js`, `lib/mpegts.js`: MP3 conversion, and audio extraction from MPEG-TS
+  - `vendor/lamejs.js`: MP3 encoder ([@breezystack/lamejs](https://www.npmjs.com/package/@breezystack/lamejs), LGPL-3.0, license in `vendor/LICENSE-lamejs`)
+  - `sw/mp3.js`: the MP3 menu item
 - `npm run typecheck`: `tsc` over the extension's JS (JSDoc and `@types/chrome`).
 - `npm run coverage`: coverage for `lib/`.
 - Unit tests: `tests/unit` (`node --test`).
-- Integration: `tests/integration`. Muxer checks against real ffmpeg output.
+- Integration: `tests/integration`. Muxer, MP3 encoder and TS demuxer, checked against real ffmpeg output.
 - E2E: `tests/e2e`. Loads the extension into Playwright's Chromium against local fixture
   pages that ffmpeg generates (ffmpeg must be on PATH). It calls the same handler the menu uses.
 - Icons: `powershell -File scripts/make-icons.ps1`.

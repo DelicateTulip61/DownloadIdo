@@ -133,7 +133,7 @@
     const title = document.title;
     if (!src && !video.srcObject) return { kind: 'none', reason: 'This video has no source yet. Play it, then try again.' };
     if (src && U.isHlsUrl(src)) return { kind: 'hls', url: src, title, duration: video.duration };
-    if (src && /^(https?|data):/i.test(src)) return { kind: 'url', url: src, media: 'video', title };
+    if (src && /^(https?|data):/i.test(src)) return { kind: 'url', url: src, media: video.tagName === 'AUDIO' ? 'audio' : 'video', title };
     if (!mark) return { kind: 'stream' };
     const marker = `v${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
     video.setAttribute(MARKER_ATTR, marker);
@@ -161,7 +161,7 @@
 
     // Real media anywhere under the cursor beats CSS backgrounds (play-button sprites, overlays).
     for (const el of stack) {
-      if (el.tagName === 'VIDEO') return describeVideo(el, true);
+      if (el.tagName === 'VIDEO' || el.tagName === 'AUDIO') return describeVideo(el, true);
       if (el.tagName === 'IMG') {
         const target = describeImage(bestImageUrl(el));
         if (target) return target;
@@ -174,11 +174,11 @@
     }
 
     // pointer-events:none media are invisible to hit testing: fall back to geometry.
-    const covering = deepQueryAll(document, 'img, video')
+    const covering = deepQueryAll(document, 'img, video, audio')
       .filter((el) => containsPoint(el, x, y))
       .sort((a, b) => area(a) - area(b));
     for (const el of covering) {
-      if (el.tagName === 'VIDEO') return describeVideo(el, true);
+      if (el.tagName === 'VIDEO' || el.tagName === 'AUDIO') return describeVideo(el, true);
       const target = describeImage(bestImageUrl(el));
       if (target) return target;
     }
@@ -249,11 +249,12 @@
   }
 
   /**
-   * Turn a blob:-sourced video into downloadable blob URLs.
-   * mode 'blob': only works when the src is a plain Blob (full file).
-   * mode 'mse':  exports what the MediaSource player has buffered (one file per track).
+   * Read a blob:-sourced video/audio element's bytes.
+   * mode 'blob': only works when the src is a plain Blob (full file) -> {tracks:[{blob, mime}]}.
+   * mode 'mse':  what the MediaSource player has buffered, one Blob per track.
+   * Errors come back as {error}; 'not-a-blob' means "try the next way".
    */
-  async function exportStream(marker, mode) {
+  async function readStream(marker, mode) {
     const video = findMarkedVideo(marker);
     if (!video) return { error: 'Video element is gone. Try again.' };
     if (mode === 'blob') {
@@ -263,30 +264,69 @@
         const blob = await (await fetch(src)).blob();
         if (!blob.size) return { error: 'empty' };
         clearMarker(marker);
-        return { files: [{ url: toBlobUrl(blob), mime: blob.type || 'video/mp4', part: '' }] };
+        return { truncated: false, tracks: [{ blob, mime: blob.type || 'video/mp4' }] };
       } catch {
         return { error: 'not-a-blob' }; // MediaSource URLs cannot be fetched
       }
     }
-
     try {
       const result = await askMainWorld(marker);
       if (result.error) return { error: String(result.error) };
       if (!validTracks(result)) return { error: 'The page returned unusable stream data.' };
-      const truncated = result.tracks.some((t) => t.truncated);
-      const muxed = await muxAudioVideo(result.tracks);
-      if (muxed) return { truncated, files: [{ url: toBlobUrl(muxed), mime: 'video/mp4', part: '' }] };
-      const multi = result.tracks.length > 1;
-      return {
-        truncated,
-        files: result.tracks.map((t) => ({
-          url: toBlobUrl(t.blob),
-          mime: t.blob.type,
-          part: multi ? (t.mime.startsWith('audio') ? 'audio' : 'video') : '',
-        })),
-      };
+      return { truncated: result.tracks.some((t) => t.truncated), tracks: result.tracks.map((t) => ({ blob: t.blob, mime: t.mime })) };
     } finally {
       clearMarker(marker);
+    }
+  }
+
+  /** Turn a blob:-sourced video into downloadable blob URLs (see readStream for modes). */
+  async function exportStream(marker, mode) {
+    const result = await readStream(marker, mode);
+    if (result.error) return result;
+    if (mode === 'blob') return { files: [{ url: toBlobUrl(result.tracks[0].blob), mime: result.tracks[0].mime, part: '' }] };
+    const { truncated } = result;
+    const muxed = await muxAudioVideo(result.tracks);
+    if (muxed) return { truncated, files: [{ url: toBlobUrl(muxed), mime: 'video/mp4', part: '' }] };
+    const multi = result.tracks.length > 1;
+    return {
+      truncated,
+      files: result.tracks.map((t) => ({
+        url: toBlobUrl(t.blob),
+        mime: t.blob.type,
+        part: multi ? (t.mime.startsWith('audio') ? 'audio' : 'video') : '',
+      })),
+    };
+  }
+
+  /**
+   * Start converting a blob:-sourced element's audio to MP3 (needs lib/mp3.js, injected on
+   * demand). Returns at once: {started: true} or {error}. The result arrives later as a
+   * runtime message {type: 'mp3-done', jobId, url | error}, with 'mp3-progress' on the way,
+   * because a long encode would outlive a single scripting call.
+   */
+  async function startStreamMp3(marker, mode, jobId) {
+    const result = await readStream(marker, mode);
+    if (result.error) return result;
+    const audio = result.tracks.find((t) => t.mime.startsWith('audio'))
+      || (result.tracks.length === 1 ? result.tracks[0] : null);
+    if (!audio) return { error: 'This video has no separate audio track to convert.' };
+    convertToMp3(audio.blob, jobId, result.truncated);
+    return { started: true };
+  }
+
+  async function convertToMp3(blob, jobId, truncated) {
+    const send = (msg) => chrome.runtime.sendMessage({ jobId, ...msg }).catch(() => {});
+    let lastPct = -1;
+    try {
+      const mp3 = await globalThis.DownloadIdoMp3.toMp3(blob, {
+        onProgress: (fraction) => {
+          const pct = Math.floor(fraction * 100);
+          if (pct - lastPct >= 2) send({ type: 'mp3-progress', pct: (lastPct = pct) });
+        },
+      });
+      send({ type: 'mp3-done', url: toBlobUrl(mp3), truncated });
+    } catch (e) {
+      send({ type: 'mp3-done', error: String((e && e.message) || e) });
     }
   }
 
@@ -309,5 +349,5 @@
     }
   }
 
-  globalThis.DownloadIdoContent = { isAlive, resolveTarget, collectAll, exportStream, fetchBlobUrl, clearMarker };
+  globalThis.DownloadIdoContent = { isAlive, resolveTarget, collectAll, exportStream, startStreamMp3, fetchBlobUrl, clearMarker };
 })();

@@ -5,7 +5,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const dir = path.join(path.dirname(fileURLToPath(import.meta.url)), '.fixtures');
-const DONE_MARKER = 'done-v3'; // bump when fixtures change
+const DONE_MARKER = 'done-v4'; // bump when fixtures change
 const ff = (...args) => execFileSync('ffmpeg', ['-y', '-loglevel', 'error', ...args], { cwd: dir });
 
 export function makeFixtures() {
@@ -29,6 +29,9 @@ export function makeFixtures() {
   ff('-f', 'lavfi', '-i', 'testsrc=size=640x360:rate=25', '-t', '4', '-c:v', 'libx264', '-profile:v', 'baseline',
     '-level', '3.0', '-pix_fmt', 'yuv420p', '-g', '25', '-movflags', 'frag_keyframe+empty_moov+default_base_moof', 'frag.mp4');
 
+  // Plain audio files for <audio> elements: AAC (gets converted) and MP3 (saved as-is).
+  ff('-f', 'lavfi', '-i', 'sine=frequency=550', '-t', '4', '-c:a', 'aac', 'tone.m4a');
+  ff('-f', 'lavfi', '-i', 'sine=frequency=330', '-t', '3', '-c:a', 'libmp3lame', 'tone.mp3');
   // Audio-only fMP4 (pairs with frag.mp4 for muxing / two-SourceBuffer MSE).
   ff('-f', 'lavfi', '-i', 'sine=frequency=440', '-t', '4', '-c:a', 'aac', '-frag_duration', '1000000',
     '-movflags', 'frag_keyframe+empty_moov+default_base_moof', 'frag-audio.m4a');

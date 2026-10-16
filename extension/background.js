@@ -2,10 +2,12 @@
 // Work lives in ./sw/*; importing those modules registers their event listeners at top level.
 import { CONTENT_FILES, errorText, notify } from './sw/common.js';
 import { downloadAll } from './sw/bulk.js';
+import { downloadMp3 } from './sw/mp3.js';
 import { downloadTarget } from './sw/target.js';
 
 const MENU_ONE = 'downloadido-one';
 const MENU_ALL = 'downloadido-all';
+const MENU_MP3 = 'downloadido-mp3';
 // Every context except the toolbar-icon menu ('action'), which has no page point to resolve.
 const C = chrome.contextMenus.ContextType;
 /** @type {[chrome.contextMenus.ContextType, ...chrome.contextMenus.ContextType[]]} */
@@ -14,6 +16,7 @@ const MENU_CONTEXTS = [C.PAGE, C.FRAME, C.SELECTION, C.LINK, C.EDITABLE, C.IMAGE
 chrome.runtime.onInstalled.addListener(() => {
   chrome.contextMenus.removeAll(() => {
     chrome.contextMenus.create({ id: MENU_ONE, title: 'Download image / video', contexts: MENU_CONTEXTS });
+    chrome.contextMenus.create({ id: MENU_MP3, title: 'Download audio as MP3', contexts: MENU_CONTEXTS });
     chrome.contextMenus.create({ id: MENU_ALL, title: 'Download all images and videos on this page', contexts: MENU_CONTEXTS });
   });
   injectIntoOpenTabs();
@@ -37,6 +40,7 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
 async function handleMenuClick(info, tab) {
   if (!tab || tab.id === undefined || tab.id < 0) return;
   if (info.menuItemId === MENU_ONE) return downloadTarget(info, tab);
+  if (info.menuItemId === MENU_MP3) return downloadMp3(info, tab);
   if (info.menuItemId === MENU_ALL) return downloadAll(tab);
 }
 

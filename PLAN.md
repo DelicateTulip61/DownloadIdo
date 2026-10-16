@@ -37,3 +37,17 @@ Right-click any image or video → **Download image / video**. Files go straight
 - YouTube & similar: MSE capture only gets buffered parts, quality switches can corrupt,
   audio/video come as separate files. Downloading may violate the site's terms.
 - Native Chrome menu items can't be shown per-element, so one menu item appears everywhere.
+
+## MP3 audio download (round 3)
+New menu item **Download audio as MP3** for `<video>`, `<audio>` and streams.
+
+| Source | Path |
+|--------|------|
+| Direct media URL | Offscreen: fetch → MP3 as-is, or decode + encode |
+| HLS | Offscreen: fetch only the audio rendition when separate; TS → demux AAC/MP3 → decode + encode |
+| Blob / MSE stream | Content script (encoder injected on demand): pick the audio track → decode + encode; reports by message |
+
+- Decode: `OfflineAudioContext(…, 44100).decodeAudioData` (probe: mp4, fMP4, ADTS, WebM/Opus, MP3 decode; MPEG-TS does not → `lib/mpegts.js` demuxer).
+- Encode: `@breezystack/lamejs` (LGPL-3.0, vendored as a separate file with its license), 192 kbps.
+- Limits: 60 minutes / 1 GB input (decoded PCM is held in memory); MP3 sources are saved without re-encoding.
+- Dead ends get a notice: no audio track, DRM, image under the cursor.

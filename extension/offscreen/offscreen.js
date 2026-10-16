@@ -12,7 +12,7 @@ const REVOKE_AFTER_MS = 10 * 60 * 1000;
 const PROGRESS_STEP = 2; // percent
 const EXT_MIME = { mp4: 'video/mp4', m4a: 'audio/mp4', ts: 'video/mp2t', aac: 'audio/aac', mp3: 'audio/mpeg' };
 
-const JOBS = { hls: runHlsJob, fetch: runFetchJob };
+const JOBS = { hls: runHlsJob, fetch: runFetchJob, mp3: runMp3Job, hlsmp3: (job) => runHlsJob({ ...job, audioOnly: true }) };
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   const run = msg?.target === 'offscreen' && sender.id === chrome.runtime.id && JOBS[msg.type];
@@ -146,21 +146,40 @@ function trackExt(track) {
   return segExt === 'aac' || segExt === 'mp3' ? segExt : 'ts';
 }
 
-async function runHlsJob(job) {
-  const tracks = await choosePlaylists(job);
-  const total = tracks.reduce((n, t) => n + t.playlist.segments.length, 0);
-  if (!total) throw new Error('The stream playlist has no segments.');
-  if (total > MAX_SEGMENTS) throw new Error('This stream is too long to download.');
-
-  let done = 0;
+/** Progress reporter for the toolbar badge: report(fraction) maps into [from, to] percent. */
+function progressReporter(job, from = 0, to = 100) {
   let lastReported = -PROGRESS_STEP;
-  const report = () => {
-    const pct = Math.floor((done / total) * 100);
+  return (fraction) => {
+    const pct = Math.floor(from + fraction * (to - from));
     if (pct - lastReported >= PROGRESS_STEP) {
       lastReported = pct;
       chrome.runtime.sendMessage({ type: 'hls-progress', tabId: job.tabId, pct });
     }
   };
+}
+
+/** A direct media URL -> MP3 (MP3 files pass through, others are decoded and re-encoded). */
+async function runMp3Job(job) {
+  const mp3 = await globalThis.DownloadIdoMp3.toMp3(await fetchBlob(job, job.url), { onProgress: progressReporter(job) });
+  return { files: [{ url: toBlobUrl(mp3), ext: 'mp3', part: '' }] };
+}
+
+async function runHlsJob(job) {
+  let tracks = await choosePlaylists(job);
+  if (job.audioOnly) {
+    // MP3 only needs the sound: fetch just the audio rendition when the stream has one.
+    tracks = [tracks.find((t) => t.part === 'audio') || tracks[0]];
+    if (U.playlistDuration(tracks[0].playlist) > globalThis.DownloadIdoMp3.MAX_SECONDS) {
+      throw new Error('Audio longer than 60 minutes can\'t be converted to MP3.');
+    }
+  }
+  const total = tracks.reduce((n, t) => n + t.playlist.segments.length, 0);
+  if (!total) throw new Error('The stream playlist has no segments.');
+  if (total > MAX_SEGMENTS) throw new Error('This stream is too long to download.');
+
+  let done = 0;
+  const reportFetch = progressReporter(job, 0, job.audioOnly ? 50 : 100);
+  const report = () => reportFetch(done / total);
 
   const loadKey = makeKeyLoader(job);
   const outputs = [];
@@ -179,6 +198,10 @@ async function runHlsJob(job) {
   }
 
   const live = tracks.some((t) => !t.playlist.endList);
+  if (job.audioOnly) {
+    const mp3 = await globalThis.DownloadIdoMp3.toMp3(outputs[0].blob, { onProgress: progressReporter(job, 50, 100) });
+    return { files: [{ url: toBlobUrl(mp3), ext: 'mp3', part: '' }], live };
+  }
   const [video, audio] = outputs;
   const muxed = outputs.length === 2 && video.ext === 'mp4' && audio.ext === 'm4a'
     ? await globalThis.DownloadIdoFmp4.mux(video.blob, audio.blob, { keepOrder: true })

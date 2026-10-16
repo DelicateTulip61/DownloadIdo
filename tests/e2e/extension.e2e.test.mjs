@@ -249,10 +249,10 @@ async function clickMenu(menuItemId, frameId = 0) {
     self.DownloadIdo.handleMenuClick({ menuItemId, frameId }, await chrome.tabs.get(tabId)), { menuItemId, frameId, tabId });
 }
 
-async function downloadOne(selector, { frame, count = 1 } = {}) {
+async function downloadOne(selector, { frame, count = 1, menu = 'downloadido-one' } = {}) {
   const start = await maxDownloadId();
   const frameId = await rightClick(selector, frame);
-  await clickMenu('downloadido-one', frameId);
+  await clickMenu(menu, frameId);
   return waitForDownloads(start, count).catch((e) => { throw new Error(`${selector}: ${e.message}`); });
 }
 
@@ -335,10 +335,26 @@ test('install/update re-injects a live detector over a dead (invalidated) one', 
   await swAction(() => self.DownloadIdo.injectIntoOpenTabs());
   assert.deepEqual(await swEval(probe, tabId), { alive: true, stale: false, staleHelpers: false });
   // Injecting the files again (as bulk download does) must not throw in an already-set-up world.
-  const errors = await swEval((id) => chrome.scripting.executeScript({
-    target: { tabId: id, frameIds: [0] }, files: ['lib/utils.js', 'lib/fmp4.js', 'content/detect.js'],
-  }).then((r) => r.map((x) => (x.error ? String(x.error.message || x.error) : ''))), tabId);
-  assert.deepEqual(errors.filter(Boolean), []);
+  // The MP3 encoder files are injected on demand, possibly more than once per page.
+  const errors = await swEval(async (id) => {
+    const files = ['lib/utils.js', 'lib/fmp4.js', 'content/detect.js', 'vendor/lamejs.js', 'lib/mpegts.js', 'lib/mp3.js'];
+    const out = [];
+    for (let i = 0; i < 2; i++) {
+      try {
+        const res = await chrome.scripting.executeScript({ target: { tabId: id, frameIds: [0] }, files });
+        for (const r of res) if (r.error) out.push(String(r.error.message || r.error));
+      } catch (e) {
+        out.push(String(e.message || e));
+      }
+    }
+    const [check] = await chrome.scripting.executeScript({
+      target: { tabId: id, frameIds: [0] },
+      func: () => typeof globalThis.DownloadIdoMp3.toMp3 === 'function' && typeof globalThis.lamejs.Mp3Encoder === 'function',
+    });
+    if (!check.result) out.push('MP3 helpers missing after re-injection');
+    return out;
+  }, tabId);
+  assert.deepEqual(errors, []);
   const [file] = await downloadOne('#plain');
   assert.match(file, /^DownloadIdo\/plain( \(\d+\))?\.png$/);
 });
@@ -501,4 +517,96 @@ test('DRM video is refused with a notice', async () => {
   assert.equal(await maxDownloadId(), start);
   const [n] = await notes();
   assert.equal(n.title, 'Protected video');
+});
+
+// ------------------------------------------------------------------ MP3
+
+const MP3_NAME = /\.mp3$/;
+
+/** A downloaded MP3: right codec and length, not silent, and Chromium can play it. */
+async function assertMp3(rel, seconds) {
+  assert.match(rel, MP3_NAME);
+  const file = inDl(rel);
+  const info = JSON.parse(execFileSync('ffprobe', ['-v', 'error', '-show_entries',
+    'stream=codec_name:format=duration', '-of', 'json', file]));
+  assert.deepEqual(info.streams.map((s) => s.codec_name), ['mp3']);
+  assert.ok(Math.abs(parseFloat(info.format.duration) - seconds) < 0.35, `duration ${info.format.duration}`);
+  const vol = /mean_volume: (-?[\d.]+) dB/.exec(spawnSync('ffmpeg', ['-i', file, '-af', 'volumedetect', '-f', 'null', '-'], { encoding: 'utf8' }).stderr);
+  assert.ok(parseFloat(vol[1]) > -35, `mean volume ${vol[1]} dB (silent?)`);
+  await page.goto(`http://localhost:${port}/iframe.html`);
+  const played = await page.evaluate(async (src) => {
+    // Played from a Blob, like a file on disk: the size is known (our test server has no Range support).
+    const a = new Audio(URL.createObjectURL(await (await fetch(src)).blob()));
+    a.muted = true;
+    await new Promise((ok, fail) => { a.onloadedmetadata = ok; a.onerror = () => fail(new Error('cannot load')); });
+    await a.play();
+    await new Promise((ok) => setTimeout(ok, 500));
+    return { duration: a.duration, time: a.currentTime };
+  }, `/dl/${rel.split('/').map(encodeURIComponent).join('/')}`);
+  assert.ok(Math.abs(played.duration - seconds) < 0.5, `browser duration ${played.duration}`);
+  assert.ok(played.time > 0, 'plays');
+}
+
+async function expectMp3Notice(selector, title) {
+  const start = await maxDownloadId();
+  await notes();
+  await rightClick(selector);
+  await clickMenu('downloadido-mp3');
+  let n;
+  for (let i = 0; i < 40 && !n; i++) {
+    await sleep(250);
+    [n] = await notes();
+  }
+  assert.equal(await maxDownloadId(), start, 'nothing downloaded');
+  assert.equal(n && n.title, title);
+}
+
+test('MP3: from a plain mp4 video and from an <audio> element', async () => {
+  await page.goto(`http://localhost:${port}/`);
+  await page.waitForLoadState('load');
+  const [fromVideo] = await downloadOne('#mp4', { menu: 'downloadido-mp3' });
+  await assertMp3(fromVideo, 6);
+  await page.goto(`http://localhost:${port}/`);
+  await page.waitForLoadState('load');
+  const [fromAudio] = await downloadOne('#aud audio', { menu: 'downloadido-mp3' });
+  await assertMp3(fromAudio, 4);
+});
+
+test('MP3: an MP3 source is saved as-is, not re-encoded', async () => {
+  await page.goto(`http://localhost:${port}/`);
+  await page.waitForLoadState('load');
+  const [file] = await downloadOne('#audmp3 audio', { menu: 'downloadido-mp3' });
+  assert.match(file, /^DownloadIdo\/tone( \(\d+\))?\.mp3$/);
+  assert.ok(sameBytes(inDl(file), path.join(mediaDir, 'tone.mp3')));
+});
+
+test('MP3: an image gives a "no audio" notice', async () => {
+  await page.goto(`http://localhost:${port}/`);
+  await page.waitForLoadState('load');
+  await expectMp3Notice('#plain', 'No audio here');
+});
+
+test('MP3: HLS transport stream (AES-128) and fMP4 with a separate audio rendition', async () => {
+  await openStream('hls');
+  const [fromTs] = await downloadOne('#v', { menu: 'downloadido-mp3' });
+  await assertMp3(fromTs, 6);
+  await openStream('hls2');
+  const [fromFmp4] = await downloadOne('#v', { menu: 'downloadido-mp3' });
+  await assertMp3(fromFmp4, 6);
+});
+
+test('MP3: page-made streams (MSE with separate audio, and a blob) are converted in the page', async () => {
+  await openStream('mse2');
+  const [fromMse] = await downloadOne('#v', { menu: 'downloadido-mp3' });
+  await assertMp3(fromMse, 4);
+  await openStream('blob');
+  const [fromBlob] = await downloadOne('#v', { menu: 'downloadido-mp3' });
+  await assertMp3(fromBlob, 6);
+});
+
+test('MP3: a video-only stream and a DRM video give notices', async () => {
+  await openStream('mse');
+  await expectMp3Notice('#v', 'Could not save audio');
+  await openStream('drm');
+  await expectMp3Notice('#v', 'Protected video');
 });

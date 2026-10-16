@@ -14,8 +14,10 @@
   "license": "ISC",
   "type": "commonjs",
   "devDependencies": {
+    "@breezystack/lamejs": "^1.2.7",
     "@types/chrome": "^0.3.4",
     "hls.js": "^1.7.3",
+    "lamejs": "^1.2.1",
     "playwright": "^1.64.0",
     "typescript": "^7.0.2"
   },
