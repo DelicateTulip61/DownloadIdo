@@ -12,9 +12,20 @@ export function notify(title, message) {
   chrome.notifications.create({ type: 'basic', iconUrl: 'icons/icon128.png', title, message });
 }
 
+/** Toolbar badge for a tab's running job ('' when done); the popup lists the same progress. */
 export function setBadge(tabId, text) {
   chrome.action.setBadgeText({ tabId, text }).catch(() => {});
+  progressWrites = progressWrites.then(async () => {
+    const { progress = {} } = await chrome.storage.session.get('progress');
+    const next = { .../** @type {Record<string, string>} */ (progress) };
+    if (text) next[tabId] = text;
+    else delete next[tabId];
+    await chrome.storage.session.set({ progress: next });
+  }).catch(() => {});
 }
+
+/** @type {Promise<unknown>} */
+let progressWrites = Promise.resolve();
 
 /** Call a DownloadIdoContent method in one frame. Returns null when the script is missing. */
 export async function callContent(tabId, frameId, method, args = []) {
@@ -24,17 +35,6 @@ export async function callContent(tabId, frameId, method, args = []) {
     args: [method, args],
   });
   return res ? res.result : null;
-}
-
-export async function mapLimit(items, limit, fn) {
-  let next = 0;
-  async function worker() {
-    while (next < items.length) {
-      const i = next++;
-      await fn(items[i], i);
-    }
-  }
-  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
 }
 
 export function localStamp(d = new Date()) {

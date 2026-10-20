@@ -79,14 +79,14 @@ var downloadIdoUtils = (function () {
   }
 
   /**
-   * Build "DownloadIdo/<subfolder>/<name>.<ext>".
-   * @param {{stem?: string, ext?: string, fallback?: string, subfolder?: string}} p
+   * Build "<folder>/<subfolder>/<name>.<ext>" (folder defaults to "DownloadIdo").
+   * @param {{stem?: string, ext?: string, fallback?: string, subfolder?: string, folder?: string}} p
    */
-  function buildDownloadPath({ stem, ext, fallback = 'download', subfolder = '' }) {
+  function buildDownloadPath({ stem, ext, fallback = 'download', subfolder = '', folder = BASE_FOLDER }) {
     const safeStem = sanitizeFilename(stem, fallback);
     const safeExt = String(ext || '').replace(/[^a-z0-9]/gi, '').toLowerCase();
     const file = safeExt ? `${safeStem}.${safeExt}` : safeStem;
-    const parts = [BASE_FOLDER];
+    const parts = [sanitizeFilename(folder, BASE_FOLDER)];
     if (subfolder) parts.push(sanitizeFilename(subfolder, 'page'));
     parts.push(file);
     return parts.join('/');

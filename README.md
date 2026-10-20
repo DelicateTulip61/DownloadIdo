@@ -1,7 +1,9 @@
 # DownloadIdo
 
+[![CI](https://github.com/ido6/DownloadIdo/actions/workflows/ci.yml/badge.svg)](https://github.com/ido6/DownloadIdo/actions/workflows/ci.yml)
+
 Chrome extension: right-click any image or video → **Download image / video**.
-Files save straight to `Downloads/DownloadIdo/` (no dialog, auto-renamed on clash).
+Files save straight to `Downloads/DownloadIdo/` (no dialog, auto-renamed on clash). Both are changeable in settings.
 
 ## Install (unpacked)
 Needs Chrome 121 or later.
@@ -33,7 +35,16 @@ A third menu item, **Download all images and videos on this page**, saves everyt
 smaller than 64 px are skipped) into `Downloads/DownloadIdo/<site> <date time>/`.
 Streamed videos are skipped there; right-click each one instead.
 
-The toolbar badge shows progress while a stream downloads.
+## Toolbar popup and settings
+- Click the toolbar icon for what's running (streams being joined or converted, with progress)
+  and your recent DownloadIdo downloads, with **Open** and **Show** for each. **Clear list**
+  empties the list; your files stay.
+- The gear opens **settings**:
+  - **Folder:** the name of the folder inside your downloads folder.
+  - **Ask where to save:** asks for each file. "Download all" never asks, so it doesn't open
+    one window per file.
+  - **MP3 quality:** 128, 192 or 320 kbps.
+- The toolbar badge also shows progress on the tab that is saving a stream.
 
 ## Limits
 - YouTube and similar sites: the capture only gets what has buffered. If the quality changed
@@ -70,6 +81,8 @@ npm test
   - `lib/mp3.js`, `lib/mpegts.js`: MP3 conversion, and audio extraction from MPEG-TS
   - `vendor/lamejs.js`: MP3 encoder ([@breezystack/lamejs](https://www.npmjs.com/package/@breezystack/lamejs), LGPL-3.0, license in `vendor/LICENSE-lamejs`)
   - `sw/mp3.js`: the MP3 menu item
+  - `sw/settings.js`: settings (`chrome.storage.sync`)
+  - `popup/`, `options/`, `ui/theme.css`: toolbar popup, settings page, shared styles
 - `npm run typecheck`: `tsc` over the extension's JS (JSDoc and `@types/chrome`).
 - `npm run coverage`: coverage for `lib/`.
 - Unit tests: `tests/unit` (`node --test`).
@@ -77,3 +90,8 @@ npm test
 - E2E: `tests/e2e`. Loads the extension into Playwright's Chromium against local fixture
   pages that ffmpeg generates (ffmpeg must be on PATH). It calls the same handler the menu uses.
 - Icons: `powershell -File scripts/make-icons.ps1`.
+- CI (GitHub Actions) runs the type check and all three test suites on every push.
+
+## License
+MIT, see [LICENSE](LICENSE). `extension/vendor/lamejs.js` is a separate work under LGPL-3.0
+([license](extension/vendor/LICENSE-lamejs)).

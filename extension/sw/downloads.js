@@ -1,6 +1,7 @@
 // Saving files into Downloads/DownloadIdo/, with full-size swaps and a hotlink retry.
 import { U, errorText, notify } from './common.js';
 import { onJobDone, startOffscreenJob } from './offscreen.js';
+import { getSettings } from './settings.js';
 
 const SNIFF_TIMEOUT_MS = 5000;
 const RETRYABLE_ERROR = /^(SERVER_|NETWORK_)/;
@@ -33,6 +34,42 @@ async function preferFullSize(url, pageUrl) {
   return probe.ok && U.isImageExt(probe.ext) ? { url: full, ext: probe.ext } : { url, ext: '' };
 }
 
+const HISTORY_KEY = 'history';
+const HISTORY_SIZE = 50;
+
+/** @type {Promise<unknown>} */
+let historyWrites = Promise.resolve();
+/** Remember our download ids (newest first) for the toolbar popup. */
+function addToHistory(id) {
+  historyWrites = historyWrites.then(async () => {
+    const { [HISTORY_KEY]: list = [] } = await chrome.storage.local.get(HISTORY_KEY);
+    const ids = /** @type {number[]} */ (list);
+    await chrome.storage.local.set({ [HISTORY_KEY]: [id, ...ids.filter((x) => x !== id)].slice(0, HISTORY_SIZE) });
+  }).catch(() => {});
+}
+
+/**
+ * Every DownloadIdo download goes through here: applies the "ask where to save" setting
+ * (never for bulk, which would open one dialog per file) and records it for the popup.
+ */
+function startDownload(url, filename, { bulk = false, retry = null } = {}) {
+  const start = (async () => {
+    const { saveAs } = await getSettings();
+    const id = await chrome.downloads.download({ url, filename, conflictAction: 'uniquify', saveAs: saveAs && !bulk });
+    addToHistory(id);
+    if (retry) rememberRetry(id, retry);
+    return id;
+  })();
+  starting.add(start);
+  start.finally(() => starting.delete(start)).catch(() => {});
+  return start;
+}
+
+// A fast refusal (403) can reach onChanged before download() has returned the id, i.e.
+// before the retry entry exists; onChanged waits for these starts to settle first.
+/** @type {Set<Promise<number>>} */
+const starting = new Set();
+
 const retries = new Map(); // downloadId -> {url, filename, pageUrl}; mirrored in session storage
 
 function rememberRetry(id, entry) {
@@ -49,8 +86,8 @@ async function takeRetry(id) {
 }
 
 /**
- * Save a URL into Downloads/DownloadIdo/. If the server refuses it (hotlink protection),
- * onChanged retries once with the page's Referer.
+ * Save a URL into the download folder (Downloads/DownloadIdo/ by default). If the server
+ * refuses it (hotlink protection), onChanged retries once with the page's Referer.
  */
 export async function saveUrl(requestedUrl, { media = 'image', subfolder = '', pageUrl = '' } = {}) {
   const isData = /^data:/i.test(requestedUrl);
@@ -58,29 +95,27 @@ export async function saveUrl(requestedUrl, { media = 'image', subfolder = '', p
   const best = media === 'image' && !isData ? await preferFullSize(requestedUrl, pageUrl) : { url: requestedUrl, ext: '' };
   const url = best.url;
   const ext = U.extFromUrl(url) || best.ext || (isData ? '' : (await probeUrl(url, pageUrl)).ext) || (media === 'video' ? 'mp4' : 'jpg');
-  const filename = U.buildDownloadPath({ stem: U.stemFromUrl(url), ext, fallback: media, subfolder });
-  const id = await chrome.downloads.download({ url, filename, conflictAction: 'uniquify', saveAs: false });
-  if (!isData && pageUrl) rememberRetry(id, { url, filename, pageUrl });
+  const { folder } = await getSettings();
+  const filename = U.buildDownloadPath({ stem: U.stemFromUrl(url), ext, fallback: media, subfolder, folder });
+  const retry = !isData && pageUrl ? { url, filename, pageUrl } : null;
+  const id = await startDownload(url, filename, { bulk: Boolean(subfolder), retry });
   return id;
 }
 
 /** Save extension/page-made blob URLs (stream exports, HLS output, blob images). */
 export async function saveFiles(files, stem, fallback = 'video') {
+  const { folder } = await getSettings();
   for (const f of files) {
     const ext = f.ext || U.extFromMime(f.mime) || (fallback === 'image' ? 'png' : 'mp4');
     const name = f.part ? `${stem} (${f.part})` : stem;
-    await chrome.downloads.download({
-      url: f.url,
-      filename: U.buildDownloadPath({ stem: name, ext, fallback }),
-      conflictAction: 'uniquify',
-      saveAs: false,
-    });
+    await startDownload(f.url, U.buildDownloadPath({ stem: name, ext, fallback, folder }));
   }
 }
 
 chrome.downloads.onChanged.addListener(async (delta) => {
   const state = delta.state && delta.state.current;
   if (state !== 'complete' && state !== 'interrupted') return;
+  if (state === 'interrupted') await Promise.allSettled([...starting]);
   const retry = await takeRetry(delta.id);
   if (!retry || state === 'complete') return;
   const [item] = await chrome.downloads.search({ id: delta.id });
@@ -99,5 +134,5 @@ onJobDone('fetch', async ({ job, url, error }) => {
     notify('Download blocked', `The site refused the file. ${error}`);
     return;
   }
-  await chrome.downloads.download({ url, filename: job.filename, conflictAction: 'uniquify', saveAs: false });
+  await startDownload(url, job.filename, { bulk: true }); // the user already chose (or skipped) a location
 });

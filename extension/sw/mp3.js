@@ -5,6 +5,7 @@ import { U, callContent, notify, setBadge } from './common.js';
 import { saveFiles, saveUrl } from './downloads.js';
 import { onJobDone, startOffscreenJob } from './offscreen.js';
 import { getPlaylists } from './playlists.js';
+import { getSettings } from './settings.js';
 
 export const MP3_FILES = ['vendor/lamejs.js', 'lib/mpegts.js', 'lib/mp3.js'];
 const MAX_SECONDS = 60 * 60; // matches lib/mp3.js: decoded audio is held in memory
@@ -33,6 +34,7 @@ export async function downloadMp3(info, tab) {
   }
   const pageUrl = target.pageUrl || info.frameUrl || tab.url || '';
   const stem = target.title || U.stemFromUrl(target.url || '') || 'audio';
+  const { mp3Kbps: kbps } = await getSettings();
 
   switch (target.kind) {
     case 'url':
@@ -42,14 +44,14 @@ export async function downloadMp3(info, tab) {
         return;
       }
       setBadge(tab.id, '0%');
-      await startOffscreenJob({ type: 'mp3', tabId: tab.id, url: target.url, pageUrl, stem });
+      await startOffscreenJob({ type: 'mp3', tabId: tab.id, url: target.url, pageUrl, stem, kbps });
       return;
     case 'hls':
       setBadge(tab.id, '0%');
-      await startOffscreenJob({ type: 'hlsmp3', tabId: tab.id, pageUrl, playlists: [target.url], stem, duration: target.duration });
+      await startOffscreenJob({ type: 'hlsmp3', tabId: tab.id, pageUrl, playlists: [target.url], stem, duration: target.duration, kbps });
       return;
     case 'stream':
-      await streamMp3(tab.id, frameId, target, pageUrl, stem);
+      await streamMp3(tab.id, frameId, target, pageUrl, stem, kbps);
       return;
     case 'drm':
       notify('Protected video', 'This video is DRM-protected, so its audio cannot be saved.');
@@ -64,9 +66,9 @@ export async function downloadMp3(info, tab) {
 }
 
 /** blob: video/audio: plain Blob → sniffed HLS playlist (audio only) → MSE capture. */
-async function streamMp3(tabId, frameId, target, pageUrl, stem) {
+async function streamMp3(tabId, frameId, target, pageUrl, stem, kbps) {
   await chrome.scripting.executeScript({ target: { tabId, frameIds: [frameId] }, files: MP3_FILES });
-  const asBlob = await startContentMp3(tabId, frameId, target.marker, 'blob', stem);
+  const asBlob = await startContentMp3(tabId, frameId, target.marker, 'blob', stem, kbps);
   if (asBlob.started) return;
   if (asBlob.error !== 'not-a-blob' && asBlob.error !== 'empty') {
     notify('Could not save audio', asBlob.error);
@@ -75,10 +77,10 @@ async function streamMp3(tabId, frameId, target, pageUrl, stem) {
   const playlists = await getPlaylists(tabId);
   if (playlists.length) {
     setBadge(tabId, '0%');
-    await startOffscreenJob({ type: 'hlsmp3', tabId, frameId, pageUrl, playlists, stem, marker: target.marker, duration: target.duration });
+    await startOffscreenJob({ type: 'hlsmp3', tabId, frameId, pageUrl, playlists, stem, marker: target.marker, duration: target.duration, kbps });
     return;
   }
-  const fromMse = await startContentMp3(tabId, frameId, target.marker, 'mse', stem);
+  const fromMse = await startContentMp3(tabId, frameId, target.marker, 'mse', stem, kbps);
   if (!fromMse.started) notify('Could not save audio', fromMse.error);
 }
 
@@ -86,13 +88,13 @@ async function streamMp3(tabId, frameId, target, pageUrl, stem) {
 
 const contentJobs = new Map(); // jobId -> {tabId, stem, partial}; mirrored in session storage
 
-async function startContentMp3(tabId, frameId, marker, mode, stem) {
+async function startContentMp3(tabId, frameId, marker, mode, stem, kbps) {
   const jobId = `mp3-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
   const job = { tabId, stem, partial: mode === 'mse' };
   contentJobs.set(jobId, job);
   chrome.storage.session.set({ [jobId]: job }).catch(() => {});
   setBadge(tabId, '0%');
-  const res = (await callContent(tabId, frameId, 'startStreamMp3', [marker, mode, jobId])) || { error: 'The page was closed.' };
+  const res = (await callContent(tabId, frameId, 'startStreamMp3', [marker, mode, jobId, kbps])) || { error: 'The page was closed.' };
   if (!res.started) {
     await takeContentJob(jobId);
     setBadge(tabId, '');
@@ -138,7 +140,7 @@ async function onOffscreenMp3Done({ job, files, live, error }) {
   setBadge(job.tabId, '');
   if (error) {
     if (job.marker !== undefined) { // HLS failed for a page stream: use what the player loaded
-      const fromMse = await startContentMp3(job.tabId, job.frameId || 0, job.marker, 'mse', job.stem);
+      const fromMse = await startContentMp3(job.tabId, job.frameId || 0, job.marker, 'mse', job.stem, job.kbps);
       if (!fromMse.started) notify('Could not save audio', fromMse.error);
       return;
     }

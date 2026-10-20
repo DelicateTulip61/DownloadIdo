@@ -304,21 +304,22 @@
    * runtime message {type: 'mp3-done', jobId, url | error}, with 'mp3-progress' on the way,
    * because a long encode would outlive a single scripting call.
    */
-  async function startStreamMp3(marker, mode, jobId) {
+  async function startStreamMp3(marker, mode, jobId, kbps) {
     const result = await readStream(marker, mode);
     if (result.error) return result;
     const audio = result.tracks.find((t) => t.mime.startsWith('audio'))
       || (result.tracks.length === 1 ? result.tracks[0] : null);
     if (!audio) return { error: 'This video has no separate audio track to convert.' };
-    convertToMp3(audio.blob, jobId, result.truncated);
+    convertToMp3(audio.blob, jobId, result.truncated, kbps);
     return { started: true };
   }
 
-  async function convertToMp3(blob, jobId, truncated) {
+  async function convertToMp3(blob, jobId, truncated, kbps) {
     const send = (msg) => chrome.runtime.sendMessage({ jobId, ...msg }).catch(() => {});
     let lastPct = -1;
     try {
       const mp3 = await globalThis.DownloadIdoMp3.toMp3(blob, {
+        kbps,
         onProgress: (fraction) => {
           const pct = Math.floor(fraction * 100);
           if (pct - lastPct >= 2) send({ type: 'mp3-progress', pct: (lastPct = pct) });

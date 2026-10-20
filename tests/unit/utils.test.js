@@ -38,6 +38,9 @@ test('buildDownloadPath puts files under the DownloadIdo folder', () => {
   assert.equal(u.buildDownloadPath({ stem: 'cat', ext: 'jpg' }), 'DownloadIdo/cat.jpg');
   assert.equal(u.buildDownloadPath({ stem: '', ext: 'mp4', fallback: 'video' }), 'DownloadIdo/video.mp4');
   assert.equal(u.buildDownloadPath({ stem: 'a', ext: 'png', subfolder: 'site: x' }), 'DownloadIdo/site_ x/a.png');
+  assert.equal(u.buildDownloadPath({ stem: 'a', ext: 'png', folder: 'My Media' }), 'My Media/a.png');
+  assert.equal(u.buildDownloadPath({ stem: 'a', ext: 'png', folder: '../../etc' }), '_.._etc/a.png', 'no path traversal');
+  assert.equal(u.buildDownloadPath({ stem: 'a', ext: 'png', folder: '' }), 'DownloadIdo/a.png');
 });
 
 test('parseSrcset handles width, density, missing descriptors and commas in URLs', () => {

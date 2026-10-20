@@ -219,7 +219,13 @@ async function waitForDownloads(afterId, count) {
   }
   const items = await swEval((id) => chrome.downloads.search({}).then((a) => a.filter((d) => d.id > id)), afterId);
   const seen = items.map((d) => `${d.state}:${d.error || ''}:${path.basename(d.filename)}`).join(', ');
-  throw new Error(`timed out waiting for ${count} download(s); got [${seen}]; notes ${JSON.stringify(await notes())}`);
+  const state = await swEval(async () => ({
+    session: Object.keys(await chrome.storage.session.get(null)),
+    contexts: (await chrome.runtime.getContexts({})).map((c) => c.contextType),
+    rules: (await chrome.declarativeNetRequest.getSessionRules()).length,
+    clickError: self.__clickError || '',
+  })).catch((e) => String(e));
+  throw new Error(`timed out waiting for ${count} download(s); got [${seen}]; notes ${JSON.stringify(await notes())}; state ${JSON.stringify(state)}`);
 }
 
 async function notes() {
@@ -242,11 +248,32 @@ async function rightClick(selector, frameUrlPart) {
   return frameId;
 }
 
-async function clickMenu(menuItemId, frameId = 0) {
+async function clickMenu(menuItemId, frameId = 0, { wait = true } = {}) {
   const tabId = await tabIdFor(page.url());
-  // Pass the real Tab object, as contextMenus.onClicked does.
-  await swAction(async ({ menuItemId, frameId, tabId }) =>
-    self.DownloadIdo.handleMenuClick({ menuItemId, frameId }, await chrome.tabs.get(tabId)), { menuItemId, frameId, tabId });
+  // Pass the real Tab object, as contextMenus.onClicked does. Awaiting the handler inside one
+  // DevTools evaluate was flaky: Playwright can drop its worker execution context mid-call
+  // ("Service worker restarted") although Chrome's logs show the worker kept running. So the
+  // handler is fired, records completion in session storage, and we poll for that.
+  const token = `click-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  await swAction(async ({ menuItemId, frameId, tabId, token }) => {
+    const tab = await chrome.tabs.get(tabId);
+    self.DownloadIdo.handleMenuClick({ menuItemId, frameId }, tab)
+      .catch((e) => String((e && e.message) || e))
+      .then((error) => chrome.storage.session.set({ [token]: { error: error || '' } }));
+    return true;
+  }, { menuItemId, frameId, tabId, token });
+  if (!wait) return;
+  const deadline = Date.now() + 60000;
+  while (Date.now() < deadline) {
+    const done = await swEval((key) => chrome.storage.session.get(key).then((r) => r[key] || null), token);
+    if (done) {
+      await swEval((key) => chrome.storage.session.remove(key), token);
+      if (done.error) throw new Error(`menu handler failed: ${done.error}`);
+      return;
+    }
+    await sleep(100);
+  }
+  throw new Error('menu handler did not finish');
 }
 
 async function downloadOne(selector, { frame, count = 1, menu = 'downloadido-one' } = {}) {
@@ -403,7 +430,9 @@ test('empty spot downloads nothing and explains why', async () => {
 
 test('download all: every frame, skips tiny images, own subfolder', async () => {
   const start = await maxDownloadId();
-  await clickMenu('downloadido-all');
+  // Don't wait for the handler: if Chrome restarts the worker mid-job, the stored queue is
+  // resumed by the new worker, and the downloads below are what counts.
+  await clickMenu('downloadido-all', 0, { wait: false });
   const files = await waitForDownloads(start, 16);
   const names = files.map((f) => path.basename(f)).sort();
   for (const f of files) assert.match(f, /^DownloadIdo\/localhost \d{4}-\d\d-\d\d \d\d-\d\d\//);
@@ -412,6 +441,23 @@ test('download all: every frame, skips tiny images, own subfolder', async () => 
     assert.ok(names.includes(expected), `missing ${expected} in ${names.join(', ')}`);
   }
   assert.ok(!names.includes('tiny.png'), 'tiny image should be skipped');
+});
+
+test('download all resumes a stored queue, retrying items that were in flight', async () => {
+  const base = `http://localhost:${port}/media/`;
+  const item = (name) => ({ url: base + name, media: 'image', pageUrl: `http://localhost:${port}/` });
+  const start = await maxDownloadId();
+  await swEval((queue) => chrome.storage.session.set({ bulkQueue: queue }), {
+    subfolder: 'resumed', pending: [item('small.jpg'), item('overlay.jpg')], inflight: [item('bg.jpg')],
+    started: 5, failed: 0, skippedStreams: 0,
+  });
+  await notes();
+  await swAction(() => self.DownloadIdo.resumeBulk().then(() => true));
+  const files = (await waitForDownloads(start, 3)).sort();
+  assert.deepEqual(files, ['DownloadIdo/resumed/bg.jpg', 'DownloadIdo/resumed/overlay.jpg', 'DownloadIdo/resumed/small.jpg']);
+  assert.deepEqual(await swEval(() => chrome.storage.session.get('bulkQueue')), {}, 'queue cleared when done');
+  const n = (await notes()).find((x) => x.title === 'Downloading page media');
+  assert.match(n.message, /^Saving 8 files to Downloads\/DownloadIdo\/resumed\./);
 });
 
 // ------------------------------------------------------------------ streams
@@ -609,4 +655,49 @@ test('MP3: a video-only stream and a DRM video give notices', async () => {
   await expectMp3Notice('#v', 'Could not save audio');
   await openStream('drm');
   await expectMp3Notice('#v', 'Protected video');
+});
+
+// ------------------------------------------------------------------ popup & settings
+
+test('popup lists recent downloads and can clear the list', async () => {
+  const popup = await ctx.newPage();
+  await popup.goto(`${extOrigin}popup/popup.html`);
+  await popup.waitForFunction(() => document.querySelectorAll('#recent .item').length > 0, null, { timeout: 10000 });
+  const names = await popup.$$eval('#recent .name', (els) => els.map((e) => e.textContent));
+  assert.ok(names.some((n) => n.endsWith('.mp3')), `recent: ${names.slice(0, 5).join(', ')}`);
+  assert.ok(names.length <= 50, 'history is capped');
+  assert.equal(await popup.isVisible('#empty'), false);
+  // Completed files offer Open / Show.
+  assert.deepEqual(await popup.$$eval('#recent .item:first-child .actions button', (b) => b.map((x) => x.textContent)), ['Open', 'Show']);
+  await popup.click('#clear');
+  await popup.waitForSelector('#empty', { state: 'visible' });
+  assert.equal(await popup.$$eval('#recent .item', (els) => els.length), 0);
+  await popup.close();
+});
+
+test('settings page changes the folder and the MP3 bitrate', async () => {
+  const options = await ctx.newPage();
+  await options.goto(`${extOrigin}options/options.html`);
+  await options.waitForFunction(() => document.getElementById('folder').value === 'DownloadIdo');
+  await options.fill('#folder', 'My: Media');
+  await options.dispatchEvent('#folder', 'change');
+  await options.check('input[name="mp3Kbps"][value="128"]');
+  await options.waitForFunction(() => document.getElementById('status').textContent === 'Saved');
+  assert.equal(await options.textContent('#preview'), 'Downloads/My_ Media/');
+  assert.deepEqual(await swEval(() => chrome.storage.sync.get(null)), { folder: 'My_ Media', saveAs: false, mp3Kbps: 128 });
+  await options.close();
+
+  try {
+    await page.goto(`http://localhost:${port}/`);
+    await page.waitForLoadState('load');
+    const [image] = await downloadOne('#plain');
+    assert.match(image, /^My_ Media\/plain( \(\d+\))?\.png$/);
+    const [mp3] = await downloadOne('#mp4', { menu: 'downloadido-mp3' });
+    assert.match(mp3, /^My_ Media\/.+\.mp3$/);
+    const bitrate = Number(execFileSync('ffprobe', ['-v', 'error', '-select_streams', 'a', '-show_entries',
+      'stream=bit_rate', '-of', 'csv=p=0', inDl(mp3)], { encoding: 'utf8' }).trim());
+    assert.ok(Math.abs(bitrate - 128000) < 8000, `bit rate ${bitrate}`);
+  } finally {
+    await swEval(() => chrome.storage.sync.clear());
+  }
 });

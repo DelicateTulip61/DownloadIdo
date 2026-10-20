@@ -160,7 +160,7 @@ function progressReporter(job, from = 0, to = 100) {
 
 /** A direct media URL -> MP3 (MP3 files pass through, others are decoded and re-encoded). */
 async function runMp3Job(job) {
-  const mp3 = await globalThis.DownloadIdoMp3.toMp3(await fetchBlob(job, job.url), { onProgress: progressReporter(job) });
+  const mp3 = await globalThis.DownloadIdoMp3.toMp3(await fetchBlob(job, job.url), { kbps: job.kbps, onProgress: progressReporter(job) });
   return { files: [{ url: toBlobUrl(mp3), ext: 'mp3', part: '' }] };
 }
 
@@ -199,7 +199,7 @@ async function runHlsJob(job) {
 
   const live = tracks.some((t) => !t.playlist.endList);
   if (job.audioOnly) {
-    const mp3 = await globalThis.DownloadIdoMp3.toMp3(outputs[0].blob, { onProgress: progressReporter(job, 50, 100) });
+    const mp3 = await globalThis.DownloadIdoMp3.toMp3(outputs[0].blob, { kbps: job.kbps, onProgress: progressReporter(job, 50, 100) });
     return { files: [{ url: toBlobUrl(mp3), ext: 'mp3', part: '' }], live };
   }
   const [video, audio] = outputs;

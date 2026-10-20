@@ -11,6 +11,7 @@ declare var DownloadIdoContent: Record<string, (...args: any[]) => any> | undefi
 declare var DownloadIdo: {
   handleMenuClick: (info: chrome.contextMenus.OnClickData, tab: chrome.tabs.Tab) => Promise<void>;
   injectIntoOpenTabs: () => Promise<void>;
+  resumeBulk: () => Promise<void>;
 };
 
 declare var module: { exports: unknown } | undefined;

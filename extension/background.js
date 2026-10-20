@@ -1,7 +1,7 @@
 // Service worker entry (ES module): context menus and install-time setup.
 // Work lives in ./sw/*; importing those modules registers their event listeners at top level.
 import { CONTENT_FILES, errorText, notify } from './sw/common.js';
-import { downloadAll } from './sw/bulk.js';
+import { downloadAll, resumeBulk } from './sw/bulk.js';
 import { downloadMp3 } from './sw/mp3.js';
 import { downloadTarget } from './sw/target.js';
 
@@ -45,4 +45,4 @@ async function handleMenuClick(info, tab) {
 }
 
 // Exposed for end-to-end tests (native context menus can't be clicked by automation).
-self.DownloadIdo = { handleMenuClick, injectIntoOpenTabs };
+self.DownloadIdo = { handleMenuClick, injectIntoOpenTabs, resumeBulk };

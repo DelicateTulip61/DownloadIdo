@@ -98,9 +98,9 @@ var downloadIdoMp3 = (function () {
   /**
    * Any media Blob -> MP3 Blob. Throws an Error with a user-facing message when impossible.
    * @param {Blob} blob
-   * @param {{onProgress?: (fraction: number) => void}} [options]
+   * @param {{kbps?: number, onProgress?: (fraction: number) => void}} [options]
    */
-  async function toMp3(blob, { onProgress } = {}) {
+  async function toMp3(blob, { kbps = KBPS, onProgress } = {}) {
     if (await isMp3(blob)) return blob;
     let source = blob;
     const ts = globalThis.DownloadIdoMpegts;
@@ -111,7 +111,7 @@ var downloadIdoMp3 = (function () {
       source = audio.blob;
     }
     const { channels, sampleRate } = await decodeAudio(source);
-    return encodeMp3(channels, sampleRate, { onProgress });
+    return encodeMp3(channels, sampleRate, { kbps, onProgress });
   }
 
   return { isMp3, encodeMp3, toMp3, MAX_SECONDS };
