@@ -166,12 +166,17 @@ before(async () => {
   proc = spawn(chromium.executablePath(), [
     '--headless=new', `--user-data-dir=${path.join(tmp, 'ud')}`, `--remote-debugging-port=${CDP_PORT}`,
     `--disable-extensions-except=${extDir}`, `--load-extension=${extDir}`, '--no-first-run', '--autoplay-policy=no-user-gesture-required',
+    // CI Linux runners can't create the user namespaces Chromium's sandbox needs.
+    ...(process.env.CI ? ['--no-sandbox'] : []),
     'about:blank',
   ]);
-  for (let i = 0; i < 50 && !browser; i++) {
+  let chromeOutput = '';
+  proc.stderr.on('data', (d) => { chromeOutput = (chromeOutput + d).slice(-4000); });
+  for (let i = 0; i < 100 && !browser; i++) {
     browser = await chromium.connectOverCDP(`http://127.0.0.1:${CDP_PORT}`).catch(() => null);
     if (!browser) await sleep(200);
   }
+  if (!browser) throw new Error(`Chromium did not start:\n${chromeOutput}`);
   ctx = browser.contexts()[0];
   // connectOverCDP renames downloads to GUIDs; restore Chrome's normal behaviour.
   const cdp = await browser.newBrowserCDPSession();
