@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>DownloadIdo</title>
+<link rel="stylesheet" href="../ui/theme.css">
+<link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header class="top">
+    <div class="brand"><img src="../icons/icon32.png" alt="">DownloadIdo</div>
+    <button class="btn ghost icon" id="settings" title="Settings" aria-label="Settings">
+      <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path fill="currentColor" d="M12 15.5a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7Zm7.43-2.53a7.8 7.8 0 0 0 0-1.94l2.03-1.58a.5.5 0 0 0 .12-.64l-1.92-3.32a.5.5 0 0 0-.6-.22l-2.39.96a7.3 7.3 0 0 0-1.68-.97l-.36-2.54A.5.5 0 0 0 14.13 3h-3.84a.5.5 0 0 0-.5.42l-.36 2.54c-.6.24-1.17.57-1.68.97l-2.39-.96a.5.5 0 0 0-.6.22L2.84 9.51a.5.5 0 0 0 .12.64l2.03 1.58a7.8 7.8 0 0 0 0 1.94l-2.03 1.58a.5.5 0 0 0-.12.64l1.92 3.32c.13.22.39.3.6.22l2.39-.96c.51.4 1.08.73 1.68.97l.36 2.54c.04.24.25.42.5.42h3.84c.25 0 .46-.18.5-.42l.36-2.54c.6-.24 1.17-.57 1.68-.97l2.39.96c.22.08.47 0 .6-.22l1.92-3.32a.5.5 0 0 0-.12-.64l-2.03-1.58Z"/></svg>
+    </button>
+  </header>
+
+  <section id="working" class="section" hidden>
+    <h2>Working</h2>
+    <ul id="jobs" class="list"></ul>
+  </section>
+
+  <section class="section">
+    <h2>Recent</h2>
+    <ul id="recent" class="list"></ul>
+    <p id="empty" class="empty" hidden>
+      Nothing yet. Right-click any image or video and choose
+      <strong>Download image / video</strong>, <strong>View image</strong> or
+      <strong>Download audio as MP3</strong>.
+    </p>
+  </section>
+
+  <footer class="bottom">
+    <button class="btn" id="folder">Open downloads folder</button>
+    <button class="btn ghost" id="clear">Clear list</button>
+  </footer>
+  <script src="popup.js"></script>
+</body>
+</html>

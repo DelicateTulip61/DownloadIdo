@@ -1,0 +1,71 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Stream Test</title>
+<style>body { margin: 0 } video { width: 320px; height: 180px; display: block; margin: 10px }</style>
+<script src="/hls.js"></script>
+</head>
+<body>
+  <video id="v" muted></video>
+  <script>
+    // ?mode=hls  -> hls.js (MSE + sniffable .m3u8), AES-128 TS
+    // ?mode=hls2 -> hls.js, fMP4 with a separate audio rendition
+    // ?mode=mse  -> hand-rolled MSE player fed from frag.mp4 (no playlist to sniff)
+    // ?mode=mse2 -> same, plus a separate audio SourceBuffer
+    // ?mode=blob -> whole file as a Blob URL
+    // ?mode=drm  -> Clear Key MediaKeys attached
+    const v = document.getElementById('v');
+    const params = new URLSearchParams(location.search);
+    const mode = params.get('mode');
+    window.ready = false;
+
+    async function feed(sb, url) {
+      const data = new Uint8Array(await (await fetch(url)).arrayBuffer());
+      const reused = new Uint8Array(64 * 1024); // players often reuse one buffer
+      for (let i = 0; i < data.length; i += reused.length) {
+        const chunk = data.subarray(i, i + reused.length);
+        reused.set(chunk);
+        sb.appendBuffer(reused.subarray(0, chunk.length));
+        await new Promise((r) => sb.addEventListener('updateend', r, { once: true }));
+      }
+    }
+
+    // withAudio: a second SourceBuffer, like YouTube-style players with separate audio.
+    async function mse(withAudio = false) {
+      const ms = new MediaSource();
+      v.src = URL.createObjectURL(ms);
+      await new Promise((r) => ms.addEventListener('sourceopen', r, { once: true }));
+      const vsb = ms.addSourceBuffer('video/mp4; codecs="avc1.42E01E"');
+      const asb = withAudio ? ms.addSourceBuffer('audio/mp4; codecs="mp4a.40.2"') : null;
+      await feed(vsb, '/media/frag.mp4');
+      if (asb) await feed(asb, '/media/frag-audio.m4a');
+      ms.endOfStream();
+    }
+
+    async function run() {
+      if (mode === 'hls' || mode === 'hls2') {
+        const hls = new Hls();
+        hls.loadSource(`/media/${mode}/master.m3u8`);
+        hls.attachMedia(v);
+        await new Promise((r) => hls.on(Hls.Events.FRAG_BUFFERED, r));
+      } else if (mode === 'mse') {
+        if (params.get('ad')) await fetch('/media/ad.m3u8'); // decoy playlist the extension will sniff
+        await mse();
+      } else if (mode === 'mse2') {
+        await mse(true);
+      } else if (mode === 'blob') {
+        v.src = URL.createObjectURL(await (await fetch('/media/clip.mp4')).blob());
+      } else if (mode === 'drm') {
+        const access = await navigator.requestMediaKeySystemAccess('org.w3.clearkey', [{
+          initDataTypes: ['cenc'], videoCapabilities: [{ contentType: 'video/mp4; codecs="avc1.42E01E"' }],
+        }]);
+        await v.setMediaKeys(await access.createMediaKeys());
+        await mse();
+      }
+      window.ready = true;
+    }
+    run().catch((e) => { window.ready = 'error: ' + e.message; });
+  </script>
+</body>
+</html>
